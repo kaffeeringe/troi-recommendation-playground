@@ -69,17 +69,6 @@ class SubsonicDatabase(Database):
         self.quiet = quiet
         self.mb_cache = {}
 
-    def sync(self):
-        self.total = 0
-        self.matched = 0
-        self.error = 0
-
-        self.run_sync()
-
-        logger.info("Checked %s albums:" % self.total)
-        logger.info("  %5d albums matched" % self.matched)
-        logger.info("  %5d recordings with errors" % self.error)
-
     def connect(self):
         if not self.config:
             logger.error("Missing credentials to connect to subsonic")
@@ -143,31 +132,66 @@ class SubsonicDatabase(Database):
         self.mb_cache[cache_key] = empty_res
         return empty_res
 
-    def run_sync(self):
+    def sync(self, incremental=True):
+        """
+        Startet den Sync-Prozess.
+        :param incremental: Wenn True, werden nur neue Alben seit dem letzten Sync verarbeitet.
+        """
+        self.total = 0
+        self.matched = 0
+        self.error = 0
+
+        self.run_sync(incremental=incremental)
+
+        logger.info("Checked %s albums:" % self.total)
+        logger.info("  %5d albums matched" % self.matched)
+        logger.info("  %5d recordings with errors" % self.error)
+
+    def run_sync(self, incremental=True):
         conn = self.connect()
         if not conn:
             return
 
-        logger.info("[ load albums ]")
+        logger.info("[ load ALL albums from Subsonic ]")
         album_ids = set()
-        albums = []
+        all_albums = []
         offset = 0
+
+        # 1. Alle Alben-Metadaten von Subsonic holen (geht sehr schnell)
         while True:
             results = conn.getAlbumList2(ltype="alphabeticalByArtist", size=self.BATCH_SIZE, offset=offset)
-            albums.extend(results["albumList2"]["album"])
-            album_ids.update([r["id"] for r in results["albumList2"]["album"]])
-
-            album_count = len(results["albumList2"]["album"])
-            offset += album_count
-            if album_count < self.BATCH_SIZE:
+            batch = results.get("albumList2", {}).get("album", [])
+            
+            if not batch:
                 break
 
-        logger.info("[ loaded %d albums ]" % len(album_ids))
+            all_albums.extend(batch)
+            offset += len(batch)
+            if len(batch) < self.BATCH_SIZE:
+                break
+
+        logger.info(f"[ Subsonic meldet insgesamt {len(all_albums)} Alben ]")
+
+        # 2. Filtern: Nur Alben behalten, die NOCH NICHT in steffen.db sind
+        albums_to_process = []
+        for album in all_albums:
+            album_name = album.get("name")
+            # Prüfen, ob Songs dieses Albums bereits in der lokalen SQLite-DB existieren
+            exists = Recording.select().where(Recording.release_name == album_name).exists()
+            if not exists:
+                albums_to_process.append(album)
+
+        if not albums_to_process:
+            print("✨ Keine fehlenden Alben gefunden. Deine Datenbank ist wirklich zu 100% aktuell!")
+            return
+
+        print(f"🔄 {len(albums_to_process)} von {len(all_albums)} Alben fehlen noch in steffen.db. Starte Import...")
 
         if not self.quiet:
-            pbar = tqdm(total=len(album_ids))
+            pbar = tqdm(total=len(albums_to_process))
 
-        for album in albums:
+        # 3. Nur die tatsächlich fehlenden Alben verarbeiten (inkl. MBID-Lookups)
+        for album in albums_to_process:
             album_info = conn.getAlbum(id=album["id"])
             raw_album_mbid = album_info.get("musicBrainzId", album.get("musicBrainzId"))
             
